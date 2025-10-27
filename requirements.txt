@@ -1,0 +1,4 @@
+tkinterdnd2
+soundfile
+numpy
+scipy

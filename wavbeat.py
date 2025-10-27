@@ -1,0 +1,975 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+import numpy as np
+import soundfile as sf
+from scipy import signal
+import glob
+import os
+import argparse
+
+# === global mix knobs ===
+FILTER_COVERAGE = 2.0      # 1.0 = original scheduling; >1.0 = more of the song under LP/BP
+FILTER_WET = 1.0           # 0..1, blend amount for filtered signal
+FILTER_GLOBAL = None       # None | "lp" | "bp"  -> force a single LP/BP across ALL samples
+
+# Defaults for the forced-all filter (used when FILTER_GLOBAL != None)
+FILTER_LP_CUTOFF_HZ = 2600.0
+FILTER_BP_LOW_HZ = 200.0
+FILTER_BP_HIGH_HZ = 3600.0
+
+# One-shot loudness
+KICK_GAIN = 1.25
+HAT_GAIN = 1.20
+CLAP_GAIN = 1.25
+CLAP_DEV_GAIN = 0.85
+
+# =========================
+# IO / Utility
+# =========================
+
+def get_next_filename(base_name: str) -> str:
+    pattern = f"{base_name}_chopped_*.wav"
+    existing = glob.glob(pattern)
+    if not existing:
+        return f"{base_name}_chopped_1.wav"
+    nums = []
+    for p in existing:
+        stem = os.path.splitext(os.path.basename(p))[0]
+        try:
+            nums.append(int(stem.rsplit("_", 1)[-1]))
+        except Exception:
+            pass
+    n = max(nums) + 1 if nums else 1
+    return f"{base_name}_chopped_{n}.wav"
+
+def load_audio_mono(path: str):
+    x, sr = sf.read(path, always_2d=False)
+    if x.ndim == 2:
+        x = x.mean(axis=1)
+    x = x.astype(np.float32)
+    # trim digital silence
+    nz = np.where(np.abs(x) > 1e-6)[0]
+    if nz.size > 0:
+        x = x[nz[0]:nz[-1]+1]
+    return x, sr
+
+def normalize(x: np.ndarray, peak: float = 0.98):
+    m = float(np.max(np.abs(x)) + 1e-12)
+    return (x / m) * peak
+
+def resample_speed(x: np.ndarray, speed: float):
+    speed = float(speed)
+    if speed == 1.0:
+        return x
+    speed = float(np.clip(speed, 0.1, 2.0))
+    up = 1000
+    down = int(round(up * speed))  # speed>1 -> fewer samples (faster)
+    y = signal.resample_poly(x, up, down)
+    return y.astype(np.float32)
+
+def simple_reverb(x: np.ndarray, sr: int, mix=0.10, time_s=0.15, fb=0.28):
+    """
+    Plate-style reverb (Freeverb-ish) using an impulse-response built from:
+      - parallel damped combs (density)
+      - serial allpasses (diffusion)
+      - pre-delay
+    Kept same signature as before; 'time_s' ~ overall size, 'fb' ~ room/decay.
+    """
+    import numpy as np
+    from scipy import signal
+
+    # -------- knobs (internals so signature stays the same) --------
+    room = float(np.clip(fb, 0.05, 0.95))          # feedback/decay
+    damp = 0.35                                     # high-freq absorption in comb loops
+    pre_delay_ms = 18.0                             # early reflection delay
+    # scale classic comb/allpass times with 'time_s' (0.35 ≈ medium room)
+    tscale = max(0.08, float(time_s)) / 0.35
+
+    # -------- build a compact IR (fast) --------
+    def _build_ir(sr: int) -> np.ndarray:
+        # IR length ~ depends on "room" and "size"
+        rt_tail = 0.6 + 2.2 * (tscale * room)       # seconds (rough heuristic)
+        L = int(sr * min(4.0, max(0.5, rt_tail)))   # clamp for safety
+
+        imp = np.zeros(L, dtype=np.float64)
+        imp[0] = 1.0
+
+        # comb delays in milliseconds (scaled)
+        comb_ms = np.array([29.7, 37.1, 41.1, 43.7]) * tscale
+        comb_d = np.maximum(8, (comb_ms * 1e-3 * sr).astype(int))
+
+        # allpass stages (fixed-ish; tiny scale helps tiny rooms)
+        ap_ms = (np.array([5.0, 1.7]) * (0.75 + 0.25 * tscale))
+        ap_d  = np.maximum(4, (ap_ms * 1e-3 * sr).astype(int))
+        ap_g  = [0.7, 0.5]
+
+        # Parallel damped combs
+        y = np.zeros(L, dtype=np.float64)
+        for d in comb_d:
+            c = np.zeros(L, dtype=np.float64)
+            lp = 0.0  # one-pole lowpass in feedback loop
+            g = room
+            for n in range(d, L):
+                # feedback sample
+                w = c[n - d]
+                lp += damp * (w - lp)              # lowpass in loop
+                c[n] = imp[n] + g * lp
+            y += c
+
+        # Serial allpasses for diffusion
+        for d, g in zip(ap_d, ap_g):
+            z = np.zeros(L, dtype=np.float64)
+            for n in range(d, L):
+                z[n] = -g * y[n] + y[n - d] + g * z[n - d]
+            y = z
+
+        # pre-delay by padding IR head with zeros
+        pd = int((pre_delay_ms * 1e-3) * sr)
+        ir = np.pad(y, (pd, 0))
+
+        # normalise IR to sane peak
+        peak = float(np.max(np.abs(ir)) + 1e-12)
+        ir = ir / peak * 0.9
+        return ir
+
+    x64 = x.astype(np.float64, copy=False)
+    ir = _build_ir(sr)
+
+    # FFT convolution (efficient for long tails)
+    y = signal.fftconvolve(x64, ir, mode="full")[:len(x64)]
+
+    # wet/dry + gentle safety drive
+    wet = float(np.clip(mix, 0.0, 1.0))
+    out = (1.0 - wet) * x64 + wet * y
+    out = np.tanh(out * 1.05)
+
+    return out.astype(np.float32)
+
+# =========================
+# Very light granular (texture only)
+# =========================
+
+def granular_synthesis(audio, sr, intensity=0.12):
+    """
+    Harmonic, smooth granular texture (keeps duration).
+    - Coherent forward read-head with light jitter (no random jumps)
+    - 50% overlap-add with Hann window (no "scramble"/gaps)
+    - Consonant pitch offsets with mild micro-detune, then re-timed to grain_len
+    """
+    if len(audio) == 0:
+        return audio
+
+    rng = np.random.default_rng()
+    intensity = float(np.clip(intensity, 0.0, 1.0))
+
+    # ~35..80 ms grains depending on intensity
+    grain_ms = 0.035 + 0.045 + 0.025 * intensity
+    grain_len = max(32, int(grain_ms * sr))
+    hop = max(16, grain_len // 2)  # 50% overlap
+    n_grains = int(np.ceil(len(audio) / hop)) + 2
+
+    win = np.hanning(grain_len).astype(np.float64)
+    out = np.zeros(len(audio) + grain_len, dtype=np.float64)
+
+    # Consonant intervals (semitones) with heavy weight on unison
+    allowed = np.array([0, 7, 12, -5], dtype=float)
+    weights = np.array([0.78, 0.12, 0.07, 0.03], dtype=float)
+    weights /= weights.sum()
+
+    head = 0
+    jitter = int(0.15 * grain_len)  # gentle wander
+    for g in range(n_grains):
+        # Coherent source window
+        center = head + rng.integers(-jitter, jitter + 1)
+        start = int(np.clip(center, 0, max(0, len(audio) - grain_len)))
+        grain = audio[start:start + grain_len].astype(np.float64)
+        grain = grain - grain.mean()  # tiny DC guard
+
+        # Consonant pitch + micro-detune
+        semi = float(rng.choice(allowed, p=weights))
+        cents = float(rng.normal(0.0, 3.0))   # ± a few cents
+        ratio = 2.0 ** ((semi + cents / 100.0) / 12.0)
+
+        # Pitch by resampling, then re-time to original grain_len for SOLA-like OLA
+        pitched = signal.resample(grain, max(4, int(round(grain_len * ratio))))
+        if len(pitched) != grain_len:
+            pitched = signal.resample(pitched, grain_len)
+
+        pos = g * hop
+        if pos >= len(out):
+            break
+        end = min(len(out), pos + grain_len)
+        out[pos:end] += pitched[:end - pos] * win[:end - pos]
+
+        head += hop
+        if head >= len(audio):
+            break
+
+    # Soft normalisation + clip
+    peak = float(np.max(np.abs(out)) + 1e-12)
+    out = np.tanh(0.9 * out / peak)
+    return out[:len(audio)].astype(np.float32)
+
+
+# =========================
+# One-shots (kick / hat)
+# =========================
+
+def _butter_hp(x, sr, cutoff=7000.0, order=4):
+    b, a = signal.butter(order, cutoff / (0.5 * sr), btype='highpass')
+    return signal.lfilter(b, a, x)
+
+def _butter_lp(x, sr, cutoff=140.0, order=4):
+    b, a = signal.butter(order, cutoff / (0.5 * sr), btype='lowpass')
+    return signal.lfilter(b, a, x)
+
+def make_kick_from_slice(x, sr):
+    if len(x) == 0:
+        return x
+    dur = int(0.11 * sr)  # ~110 ms
+    g = x[:dur].astype(np.float64)
+    g = _butter_lp(g, sr, cutoff=np.random.uniform(90.0, 160.0))
+    t = np.linspace(0.0, 1.0, len(g))
+    env = np.exp(-6.5 * t)
+    g *= env
+    n = min(16, len(g))
+    g[:n] += 0.4 * g[:n]
+    g /= (np.max(np.abs(g)) + 1e-9)
+    return g.astype(np.float32)
+
+def make_hat_variants_from_slice(x, sr):
+    """Return (closed_hat, open_hat) variants."""
+    if len(x) == 0:
+        return x, x
+    # Closed
+    c_dur = int(np.random.uniform(0.035, 0.06) * sr)
+    c = x[:c_dur].astype(np.float64)
+    c = _butter_hp(c, sr, cutoff=np.random.uniform(7000.0, 9500.0))
+    t = np.linspace(0.0, 1.0, len(c))
+    c *= np.exp(-13.0 * t)
+    if len(c) > 8:
+        k = np.random.randint(2, 4)
+        c = signal.resample(c[::k], len(c))
+    c /= (np.max(np.abs(c)) + 1e-9)
+
+    # Open (longer, breathier)
+    o_dur = int(np.random.uniform(0.09, 0.14) * sr)
+    o = x[:o_dur].astype(np.float64)
+    o = _butter_hp(o, sr, cutoff=np.random.uniform(6000.0, 8500.0))
+    t = np.linspace(0.0, 1.0, len(o))
+    o *= np.exp(-7.0 * t)
+    if len(o) > 8:
+        k = np.random.randint(2, 3)
+        o = signal.resample(o[::k], len(o))
+    o /= (np.max(np.abs(o)) + 1e-9)
+
+    return c.astype(np.float32), o.astype(np.float32)
+
+# =========================
+# Events (kicks/hats) on triplet grid
+# =========================
+
+def generate_regular_kick_onsets(sr, bpm, length_samples):
+    """4-on-the-floor: kicks at the start of every beat."""
+    beat = 60.0 / bpm
+    total_beats = int(np.ceil(length_samples / (beat * sr)))
+    positions = [int(b * beat * sr) for b in range(total_beats)]
+    return np.array(positions, dtype=int)
+
+def generate_sparse_shuffled_hat_events(sr, bpm, length_samples,
+                                        base_density=0.35, shuffle=0.18, rng=None):
+    """
+    Sparse hats on a shuffled triplet grid.
+    Returns list of (position_samples, is_open_bool, gain_float).
+    """
+    if rng is None:
+        rng = np.random.default_rng()
+
+    beat = 60.0 / bpm
+    tri = beat / 3.0
+    total_beats = int(np.ceil(length_samples / (beat * sr)))
+    events = []
+
+    # per-triplet bias (prefer the last, swung one)
+    hat_bias = [0.12, 0.22, 0.52]  # sum <= 1, scaled by base_density and bar_scale
+
+    for b in range(total_beats):
+        bar_idx = b // 4
+        # bar-level sparsity variance
+        bar_scale = 0.5 + 0.5 * rng.random()  # 0.5..1.0
+        # occasional very sparse bars
+        if rng.random() < 0.18:
+            bar_scale *= 0.6
+
+        offsets = [0.0, (1.0 + shuffle) * tri, (2.0 - shuffle) * tri]
+        for i, off in enumerate(offsets):
+            pos = int((b * beat + off) * sr)
+            if pos >= length_samples:
+                break
+            p = base_density * hat_bias[i] * bar_scale
+            if rng.random() < p:
+                is_open = rng.random() < 0.18  # 18% open
+                gain = (0.38 + 0.45 * rng.random()) * (1.2 if is_open else 1.0)
+                events.append((pos, is_open, float(gain)))
+    return events
+
+# =========================
+# Slice library + rhythmic scheduler (constant-speed chops)
+# =========================
+
+def make_small_slices(x: np.ndarray, sr: int, count: int = 64, min_ms=70, max_ms=260):
+    rng = np.random.default_rng()
+    slices = []
+    L = len(x)
+    for _ in range(count):
+        if L < sr // 10:
+            break
+        dur = rng.integers(int(min_ms/1000.0 * sr), int(max_ms/1000.0 * sr))
+        start = rng.integers(0, max(1, L - dur))
+        seg = x[start:start + dur].copy().astype(np.float32)
+        # light edge fades
+        n = len(seg)
+        f = max(8, min(n // 6, int(0.01 * sr)))
+        if f > 0 and n > 2*f:
+            w = np.hanning(2*f)
+            seg[:f] *= w[:f]
+            seg[-f:] *= w[-f:]
+        slices.append(seg)
+    return slices
+
+def _rate_slices(slice_lib, rate: float):
+    """Apply playback-rate (pitch+speed) to backing-chop slices only."""
+    r = float(np.clip(rate, 0.1, 2.0))
+    if abs(r - 1.0) < 1e-9:
+        return slice_lib
+    return [resample_speed(seg, r) for seg in slice_lib]
+
+def _fit_len_no_pitch(seg: np.ndarray, target_len: int) -> np.ndarray:
+    """Crop/pad WITHOUT time-scaling -> keeps speed/pitch constant."""
+    n = len(seg)
+    if n == target_len:
+        out = seg.copy()
+    elif n > target_len:
+        out = seg[:target_len].copy()
+    else:
+        out = np.pad(seg, (0, target_len - n))
+    # micro fades to avoid clicks
+    f = max(8, min(target_len // 12, 64))
+    if target_len >= 2*f:
+        w = np.hanning(2*f)
+        out[:f] *= w[:f]
+        out[-f:] *= w[-f:]
+    return out.astype(np.float32)
+
+def _envelope_abs_smooth(x: np.ndarray, sr: int, smooth_ms: float = 5.0) -> np.ndarray:
+    """Fast rectified + moving-average envelope."""
+    win = max(1, int((smooth_ms * 1e-3) * sr))
+    if win <= 1:
+        return np.abs(x).astype(np.float32)
+    env = np.convolve(np.abs(x).astype(np.float64), np.ones(win) / win, mode="same")
+    return env.astype(np.float32)
+
+def _detect_transient_peaks(env: np.ndarray, sr: int,
+                            min_dist_ms: float = 20.0,
+                            height_q: float = 0.90) -> np.ndarray:
+    """
+    Robust transient picker on a rectified/smoothed envelope.
+    - Smooths with short Hann
+    - Subtracts a local median baseline (removes sustain)
+    - Half-wave rectifies + light compression
+    - Picks peaks with adaptive height + prominence + width constraints
+    """
+    e = env.astype(np.float64)
+
+    # Short smoothing (~3 ms)
+    win = max(9, int(0.003 * sr))
+    if win % 2 == 0:
+        win += 1
+    h = np.hanning(win)
+    h /= h.sum()
+    e = np.convolve(e, h, mode="same")
+
+    # Local baseline (median) to isolate onsets
+    k = max(3, int(0.10 * sr))
+    if k % 2 == 0:
+        k += 1
+    baseline = signal.medfilt(e, kernel_size=k)
+
+    # Novelty: baseline-removed + half-wave + gentle comp
+    nov = e - baseline
+    nov[nov < 0.0] = 0.0
+    nov = np.sqrt(nov + 1e-12)
+
+    # Adaptive threshold + constraints
+    dist = max(1, int((min_dist_ms * 1e-3) * sr))
+    thr = float(np.quantile(nov, np.clip(height_q, 0.0, 1.0)))
+    prom = 0.6 * thr
+    wmin = max(1, int(0.002 * sr))   # ~2 ms
+    wmax = max(wmin + 1, int(0.03 * sr))  # ~30 ms
+
+    pk, _ = signal.find_peaks(nov, height=thr, prominence=prom,
+                              width=(wmin, wmax), distance=dist)
+    return pk.astype(int)
+
+def make_small_slices_low_peak(x: np.ndarray, sr: int, count: int = 64,
+                               min_ms: float = 300.0, max_ms: float = 600.0,
+                               step_ms: float = 20.0,
+                               height_q: float = 0.90, min_dist_ms: float = 20.0,
+                               low_quantile: float = 0.25) -> list:
+    """
+    Build slices from windows that have the FEWEST transient peaks.
+    - Only affects backing chops; do NOT use this for kicks/hats/claps.
+    """
+    if len(x) < int(0.1 * sr):
+        return []
+
+    rng = np.random.default_rng()
+
+    # Envelope + peaks once for the whole file
+    env = _envelope_abs_smooth(x, sr, smooth_ms=5.0)
+    peaks = _detect_transient_peaks(env, sr, min_dist_ms=min_dist_ms, height_q=height_q)
+
+    # Peak indicator & prefix sum for O(1) counts per window
+    ispk = np.zeros(len(x), dtype=np.int32)
+    ispk[np.clip(peaks, 0, len(ispk) - 1)] = 1
+    csum = np.concatenate([[0], np.cumsum(ispk)])
+
+    # Candidate windows on a grid
+    step = max(1, int((step_ms * 1e-3) * sr))
+    Lmin = max(8, int((min_ms * 1e-3) * sr))
+    Lmax = max(Lmin + 1, int((max_ms * 1e-3) * sr))
+    starts = np.arange(0, max(1, len(x) - Lmin), step, dtype=int)
+
+    # Loudness floor to avoid near-silence
+    env_floor = float(np.quantile(env, 0.25)) * 0.5
+
+    cands = []
+    for s in starts:
+        dur = int(rng.integers(Lmin, Lmax))
+        e = min(len(x), s + dur)
+        if e - s < Lmin:
+            continue
+        # mean envelope gate
+        m_env = float(env[s:e].mean())
+        if m_env < env_floor:
+            continue
+        # peak count
+        pk_cnt = int(csum[e] - csum[s])
+        cands.append((pk_cnt, s, e))
+
+    if not cands:
+        # fallback to original random slicer
+        return make_small_slices(x, sr, count=count, min_ms=min_ms, max_ms=max_ms)
+
+    # Keep the lowest-peak subset, then sample from it
+    cands.sort(key=lambda t: t[0])
+    k = max(8, int(len(cands) * float(np.clip(low_quantile, 0.01, 1.0))))
+    low_pk_zone = cands[:k]
+
+    slices = []
+    rng.shuffle(low_pk_zone)
+    for pk_cnt, s, e in low_pk_zone[:count * 2]:  # a bit extra to survive fades
+        seg = x[s:e].astype(np.float32).copy()
+        # soft edge fades
+        n = len(seg)
+        f = max(8, min(n // 6, int(0.01 * sr)))
+        if f > 0 and n > 2 * f:
+            w = np.hanning(2 * f)
+            seg[:f] *= w[:f]
+            seg[-f:] *= w[-f:]
+        slices.append(seg)
+        if len(slices) >= count:
+            break
+
+    if not slices:  # rare fallback
+        return make_small_slices(x, sr, count=count, min_ms=min_ms, max_ms=max_ms)
+    return slices
+
+def _overlap_add_legato(out: np.ndarray, seg: np.ndarray, start: int, xfade: int) -> None:
+    """
+    Writes seg into out starting at 'start', using an equal-power crossfade
+    (linear-in / linear-out) over 'xfade' samples to avoid gaps/clicks.
+    Modifies 'out' in-place.
+    """
+    L = len(out)
+    if start >= L:
+        return
+    seg = seg.astype(np.float64)
+    end = min(L, start + len(seg))
+    seg_len = end - start
+    if seg_len <= 0:
+        return
+
+    # Crossfade with previous content
+    cross = min(xfade, seg_len, start)
+    if cross > 0:
+        fo = np.linspace(1.0, 0.0, cross)   # fade-out for existing tail
+        fi = 1.0 - fo                       # fade-in for new seg
+        out[start - cross:start] = (
+            out[start - cross:start].astype(np.float64) * fo +
+            seg[:cross] * fi
+        )
+        w_start = start + 0
+        s_off = cross
+    else:
+        w_start = start
+        s_off = 0
+
+    # Write the rest
+    remain = seg_len - (w_start - start) - s_off
+    if remain > 0:
+        out[w_start:w_start + remain] += seg[s_off:s_off + remain]
+
+def _stitch_to_len_legato(slice_lib, target_len, sr, xfade_ms=12):
+    """
+    Build a segment of EXACT length by chaining slices with crossfades.
+    No resampling, no padding → truly legato inside each grid cell.
+    """
+    rng = np.random.default_rng()
+    out = np.zeros(int(target_len), dtype=np.float32)
+    xfade = max(0, int((xfade_ms / 1000.0) * sr))
+    pos = 0
+    while pos < target_len:
+        remain = target_len - pos
+        seg = slice_lib[rng.integers(0, len(slice_lib))]
+        seg_use = seg[:remain].astype(np.float32)  # crop if longer; never pad
+        _overlap_add_legato(out, seg_use, start=pos, xfade=xfade)
+        pos += len(seg_use)
+    return out
+
+def place_slices_on_grid_constant_speed(slice_lib, sr, bpm, bars=8, subdiv=2,
+                                        density=0.65, allow_double=True,
+                                        start_jitter=0.02, granular_chance=0.01):
+    """
+    Lay slices ON the grid with constant slice speed (no per-slice resampling).
+    Each placed slice length is exactly 1x or 2x grid; we crop/pad to fit.
+    """
+    assert subdiv >= 1
+    beat_samps = int(sr * 60.0 / bpm)
+    grid = beat_samps // subdiv
+    total_beats = 4 * bars
+    out_len = total_beats * beat_samps
+    out = np.zeros(out_len, dtype=np.float32)
+
+    rng = np.random.default_rng()
+    granular_used = 0
+
+    for cell_idx, base_pos in enumerate(range(0, out_len, grid)):
+        if rng.random() > density:
+            continue
+
+        # choose 1x or 2x grid fixed length (no time-scaling)
+        use_double = allow_double and (rng.random() < 0.15)
+        target_len = grid * (2 if use_double else 1)
+
+        seg = _stitch_to_len_legato(slice_lib, target_len, sr, xfade_ms=xfade_ms)
+
+        # rare, gentle granular on the stitched segment (length unchanged)
+        if rng.random() < granular_chance and len(seg) > int(0.04 * sr):
+            seg = granular_synthesis(seg, sr, intensity=0.12)
+            granular_used += 1
+
+        # small start jitter for feel (does not change slice length)
+        jitter = int(grid * start_jitter * rng.uniform(-1.0, 1.0))
+        pos = np.clip(base_pos + jitter, 0, out_len - 1)
+        end = min(out_len, pos + len(seg))
+        out[pos:end] += seg[:end - pos]
+
+    # limit
+    peak = np.max(np.abs(out))
+    if peak > 1.0:
+        out /= peak
+    return out.astype(np.float32), out_len, granular_used
+
+def place_slices_legato_on_grid_constant_speed(slice_lib, sr, bpm, bars=8, subdiv=2,
+                                               density=0.6, allow_double=True,
+                                               granular_chance=0.01, xfade_ms=12):
+    """
+    Legato version: slices are back-to-back with a small crossfade; no silent gaps.
+    - Lengths are exact multiples of the grid (1x or 2x), so groove stays locked.
+    - 'density' steers how often we choose 1x (dense) vs 2x (more sustained).
+      (p_1x = density, p_2x = 1 - density)
+    """
+    assert subdiv >= 1
+    beat_samps = int(sr * 60.0 / bpm)
+    grid = beat_samps // subdiv
+    total_beats = 4 * bars
+    out_len = total_beats * beat_samps
+    out = np.zeros(out_len, dtype=np.float32)
+
+    rng = np.random.default_rng()
+    granular_used = 0
+    xfade = max(0, int((xfade_ms / 1000.0) * sr))
+
+    cursor = 0
+    while cursor < out_len:
+        # choose 1x or 2x grid; keep all starts on-grid by construction
+        use_double = allow_double and (rng.random() > density)
+        target_len = grid * (2 if use_double else 1)
+        target_len = min(target_len, out_len - max(0, cursor - xfade))
+
+        # Stitch multiple source slices to fill the cell EXACTLY, no padding → true legato
+        seg = _stitch_to_len_legato(slice_lib, target_len, sr, xfade_ms=xfade_ms)
+
+        # rare, gentle granular on the stitched segment (length unchanged)
+        if rng.random() < granular_chance and len(seg) > int(0.04 * sr):
+            seg = granular_synthesis(seg, sr, intensity=0.12)
+            granular_used += 1
+
+        # Legato write: start at (cursor - xfade) to overlap smoothly
+        start = max(0, cursor - xfade)
+        _overlap_add_legato(out, seg, start, xfade)
+
+        cursor = start + len(seg)
+
+    # protect headroom
+    peak = float(np.max(np.abs(out)))
+    if peak > 1.0:
+        out /= peak
+    return out.astype(np.float32), out_len, granular_used
+
+def _butter_bp(x, sr, low=900.0, high=3500.0, order=4):
+    low = max(40.0, float(low))
+    high = min(0.49 * sr, float(high))
+    if high <= low:
+        high = low * 1.5
+    b, a = signal.butter(order, [low / (0.5 * sr), high / (0.5 * sr)], btype='bandpass')
+    return signal.lfilter(b, a, x)
+
+def make_clap_from_slice(x, sr):
+    """
+    Snappy clap from the source sample: band-pass + short multi-flam + decay.
+    """
+    if len(x) == 0:
+        return x
+    rng = np.random.default_rng()
+    dur = int(rng.uniform(0.09, 0.16) * sr)
+    g = x[:dur].astype(np.float64)
+
+    # Core tone
+    lo = rng.uniform(800.0, 1200.0)
+    hi = rng.uniform(3000.0, 5000.0)
+    g = _butter_bp(g, sr, low=lo, high=hi, order=4)
+
+    # Short decay + soft drive
+    t = np.linspace(0.0, 1.0, len(g))
+    g *= np.exp(-9.0 * t)
+    g = np.tanh(1.6 * g)
+
+    # Tiny flam (a couple early reflections)
+    out = g.copy()
+    for w, ms in [(0.55, rng.uniform(3.0, 6.0)),
+                  (0.35, rng.uniform(7.0, 12.0))]:
+        d = int(ms * 1e-3 * sr)
+        if d < len(g):
+            tmp = np.zeros_like(g)
+            tmp[d:] = g[:-d]
+            out += w * tmp
+
+    out /= (np.max(np.abs(out)) + 1e-9)
+    return out.astype(np.float32)
+
+def generate_clap_positions_from_kicks(kick_positions):
+    """
+    Every 2nd kick → backbeat (2, 4, ...).
+    """
+    if len(kick_positions) == 0:
+        return np.array([], dtype=int)
+    return np.asarray(kick_positions[1::2], dtype=int)
+
+def generate_deviant_claps(base_positions, sr, prob=0.08, max_ms=22.0, rng=None):
+    """
+    Bonus claps that rarely deviate in timing (+/- jitter).
+    Returns list of positions (ints).
+    """
+    if rng is None:
+        rng = np.random.default_rng()
+    dev = []
+    max_jit = int(abs(max_ms) * 1e-3 * sr)
+    if max_jit <= 0:
+        return dev
+    for p in base_positions:
+        if rng.random() < prob:
+            dev.append(int(p + rng.integers(-max_jit, max_jit + 1)))
+    return dev
+
+def apply_random_filter_schedules(x, sr, bpm, bars, subdiv, rng=None):
+    """
+    LP/BP over the chop track.
+    - If FILTER_GLOBAL is "lp" or "bp": apply that filter across the ENTIRE track with FILTER_WET.
+    - Otherwise, schedule several LP/BP events; FILTER_COVERAGE increases time under filters,
+      FILTER_WET increases their blend amount.
+    """
+    if rng is None:
+        rng = np.random.default_rng()
+
+    y = x.astype(np.float64).copy()
+
+    # --- Global (force all) path ---
+    if FILTER_GLOBAL in ("lp", "bp"):
+        if FILTER_GLOBAL == "lp":
+            cutoff = float(FILTER_LP_CUTOFF_HZ)
+            b, a = signal.butter(4, cutoff / (0.5 * sr), btype='lowpass')
+        else:
+            lo = float(FILTER_BP_LOW_HZ)
+            hi = float(min(FILTER_BP_HIGH_HZ, 0.49 * sr))
+            if hi <= lo:
+                hi = lo * 1.5
+            b, a = signal.butter(4, [lo / (0.5 * sr), hi / (0.5 * sr)], btype='bandpass')
+
+        wet = float(np.clip(FILTER_WET, 0.0, 1.0))
+        yf = signal.lfilter(b, a, y)
+        out = (1.0 - wet) * y + wet * yf
+        peak = np.max(np.abs(out))
+        if peak > 1.0:
+            out /= peak
+        return out.astype(np.float32)
+
+    # --- Scheduled events path ---
+    beat = 60.0 / bpm
+    beat_samps = int(sr * beat)
+    total_beats = 4 * bars
+
+    # more coverage => more/longer events
+    cov = float(max(0.0, FILTER_COVERAGE))
+    n_events = int(np.clip(rng.integers(2, 6) * (bars / 8.0) * cov, 1, max(1, int(7 * cov))))
+    fades_ms = (rng.uniform(18.0, 35.0), rng.uniform(18.0, 35.0))
+
+    for _ in range(n_events):
+        dur_beats = float(rng.uniform(0.5, 2.5 * cov))
+        start_beat = float(rng.uniform(0.0, max(0.0, total_beats - dur_beats)))
+        end_beat = start_beat + dur_beats
+
+        s = int(start_beat * beat_samps)
+        e = int(end_beat * beat_samps)
+        if e - s < int(0.15 * sr):
+            continue
+
+        seg = y[s:e].copy()
+
+        # random LP or BP
+        if rng.random() < 0.5:
+            cutoff = float(rng.uniform(1400.0, 4800.0))
+            b, a = signal.butter(4, cutoff / (0.5 * sr), btype='lowpass')
+        else:
+            lo = float(rng.uniform(350.0, 1400.0))
+            hi = float(rng.uniform(lo * 1.8, min(lo * 3.6, 0.49 * sr)))
+            b, a = signal.butter(4, [lo / (0.5 * sr), hi / (0.5 * sr)], btype='bandpass')
+
+        seg_f = signal.lfilter(b, a, seg)
+
+        fin_ms, fout_ms = fades_ms
+        fin = max(8, min(int(fin_ms * 1e-3 * sr), len(seg_f) // 3))
+        fout = max(8, min(int(fout_ms * 1e-3 * sr), len(seg_f) // 3))
+
+        env = np.ones(len(seg_f), dtype=np.float64)
+        env[:fin] *= np.linspace(0.0, 1.0, fin)
+        env[-fout:] *= np.linspace(1.0, 0.0, fout)
+        env *= float(np.clip(FILTER_WET, 0.0, 1.0))
+
+        seg_out = seg * (1.0 - env) + seg_f * env
+        y[s:e] = seg_out
+
+    peak = np.max(np.abs(y))
+    if peak > 1.0:
+        y /= peak
+    return y.astype(np.float32)
+
+
+# =========================
+# Mixing helpers
+# =========================
+
+def mix_one_shots(base, one_shot, positions, gain=1.0):
+    out = base.astype(np.float64).copy()
+    one = (one_shot.astype(np.float64) * gain)
+    L = len(out)
+    for p in positions:
+        if p >= L:
+            continue
+        end = min(L, p + len(one))
+        seg = end - p
+        if seg > 0:
+            out[p:end] += one[:seg]
+    peak = np.max(np.abs(out))
+    if peak > 1.0:
+        out /= peak
+    return out.astype(np.float32)
+
+def mix_hat_events(base, hat_closed, hat_open, events, global_gain=1.0):
+    """
+    events: list of (pos, is_open, gain); global_gain scales all hats.
+    """
+    out = base.astype(np.float64).copy()
+    L = len(out)
+    gg = float(global_gain)
+    for pos, is_open, g in events:
+        hat = hat_open if is_open else hat_closed
+        end = min(L, pos + len(hat))
+        seg = end - pos
+        if seg > 0:
+            out[pos:end] += (hat[:seg].astype(np.float64) * g * gg)
+    peak = np.max(np.abs(out))
+    if peak > 1.0:
+        out /= peak
+    return out.astype(np.float32)
+
+# =========================
+# Main process
+# =========================
+
+def process(input_file: str, bpm: int = 120, speed: float = 1.0,
+            bars: int = None, subdiv: int = 2,
+            base_density: float = 0.6, reverb: float = 1.0,
+            hat_density: float = 0.35,
+            clap: bool = False,              # snare-ish
+            clap_dev_prob: float = 0.08,
+            clap_dev_ms: float = 22.0,
+            rate: float = 1.0):              # rate now targets backing chops ONLY
+    # Load
+    audio, sr = load_audio_mono(input_file)
+
+    # Derive default bars from file length if not set
+    if bars is None:
+        total_beats_est = int((len(audio) / sr) / (60.0 / bpm))
+        bars = int(max(4, min(16, total_beats_est // 4)))  # clamp 4..16
+
+    # Slice library from source
+    chop_slice_lib = make_small_slices_low_peak(audio, sr, count=64, min_ms=300, max_ms=600)
+    perc_slice_lib = make_small_slices(audio, sr, count=64, min_ms=300, max_ms=600)
+
+    # >>> Apply 'rate' to BACKING CHOPS ONLY (kick/hat/clap are unaffected)
+    chop_slice_lib = _rate_slices(chop_slice_lib, rate)
+
+    # Quantized chop track (constant-speed, legato)
+    chop_track, out_len, granular_used = place_slices_legato_on_grid_constant_speed(
+        chop_slice_lib, sr, bpm, bars=bars, subdiv=subdiv, density=base_density,
+        allow_double=True, granular_chance=0.01, xfade_ms=30
+    )
+
+    # Scheduled LP/BP on chops
+    chop_track = apply_random_filter_schedules(chop_track, sr, bpm, bars, subdiv)
+
+    # One-shot percs from source (NOT rate-scaled)
+    rng = np.random.default_rng()
+    kick_src = (perc_slice_lib[rng.integers(0, len(perc_slice_lib))] 
+                if perc_slice_lib else audio[:int(0.12 * sr)])
+    hat_src  = (perc_slice_lib[rng.integers(0, len(perc_slice_lib))] 
+                if perc_slice_lib else audio[:int(0.14 * sr)])
+
+    kick = make_kick_from_slice(kick_src, sr)
+    hat_closed, hat_open = make_hat_variants_from_slice(hat_src, sr)
+
+    # Kicks: strict regular pattern
+    k_on = generate_regular_kick_onsets(sr, bpm, out_len)
+
+    # Hats: sparse, with per-hit variance and occasional open hats
+    shuffle_used = float(np.random.uniform(0.12, 0.22))
+    hat_events = generate_sparse_shuffled_hat_events(
+        sr, bpm, out_len, base_density=hat_density, shuffle=shuffle_used, rng=rng
+    )
+
+    # Layer percussion (kick + hat)
+    layered = mix_one_shots(chop_track, kick, k_on, gain=KICK_GAIN)
+    layered = mix_hat_events(layered, hat_closed, hat_open, hat_events, global_gain=HAT_GAIN)
+
+    # Optional claps (snare-ish)
+    claps_main = 0
+    claps_dev = 0
+    if clap:
+        clap_src = (perc_slice_lib[rng.integers(0, len(perc_slice_lib))] 
+                    if perc_slice_lib else audio[:int(0.16 * sr)])
+        clap_one = make_clap_from_slice(clap_src, sr)
+
+        c_on = generate_clap_positions_from_kicks(k_on)  # backbeat
+        layered = mix_one_shots(layered, clap_one, c_on, gain=CLAP_GAIN)
+        claps_main = int(len(c_on))
+
+        c_dev = generate_deviant_claps(c_on, sr, prob=clap_dev_prob, max_ms=clap_dev_ms, rng=rng)
+        if len(c_dev):
+            layered = mix_one_shots(layered, clap_one, c_dev, gain=CLAP_DEV_GAIN * CLAP_GAIN)
+            claps_dev = int(len(c_dev))
+
+    # Glue reverb controlled by 0..2 knob (0 disables; 1 ≈ previous)
+    r = float(np.clip(reverb, 0.0, 2.0))
+    if r > 0.0:
+        mix    = 0.08 * r
+        time_s = 0.14 * (0.5 + 0.5 * r)  # scales size gently
+        fb     = 0.26 * (0.5 + 0.5 * r)  # scales decay gently
+        layered = simple_reverb(layered, sr, mix=mix, time_s=time_s, fb=fb)
+
+    # Global speed still affects the whole mix (tempo/pitch)
+    final = resample_speed(layered, speed)
+    final = normalize(np.tanh(final * 1.04), 0.98)
+
+    meta = {
+        "bpm": bpm,
+        "speed": speed,
+        "bars": bars,
+        "subdiv": subdiv,
+        "shuffle": round(shuffle_used, 3),
+        "granular_used": int(granular_used),
+        "kicks": int(len(k_on)),
+        "hats": int(len(hat_events)),
+        "claps": claps_main,
+        "claps_deviant": claps_dev,
+        "sr": sr,
+        "length_sec": round(len(final)/sr, 3),
+        "chop_rate": float(rate),
+        "reverb": float(r),
+    }
+    return final, sr, meta
+
+
+def main(input_file: str, bpm: int = 120, speed: float = 1.0,
+         rate: float = 1.0,
+         bars: int = None, subdiv: int = 2, hat_density: float = 0.35,
+         clap: bool = False, clap_dev_prob: float = 0.08, clap_dev_ms: float = 22.0,
+         reverb: float = 1.0):
+    # Build with 'rate' applied only to backing chops
+    data, sr, meta = process(
+        input_file, bpm=bpm, speed=speed, bars=bars, subdiv=subdiv,
+        base_density=0.6, reverb=reverb, hat_density=hat_density,
+        clap=clap, clap_dev_prob=clap_dev_prob, clap_dev_ms=clap_dev_ms,
+        rate=rate
+    )
+
+    # Output samplerate no longer changes with 'rate' (percs must stay put)
+    sr_out = sr
+
+    base_name = os.path.splitext(os.path.basename(input_file))[0]
+    output_file = get_next_filename(base_name)
+    sf.write(output_file, data, sr_out)
+
+    length_sec_out = round(len(data) / sr_out, 3)
+
+    print(
+        f"saved: {output_file} | "
+        f"bpm {meta['bpm']} | bars {meta['bars']} | subdiv {meta['subdiv']} | "
+        f"shuffle {meta['shuffle']} | speed {meta['speed']} | rate(chops) {meta['chop_rate']} | "
+        f"reverb {meta['reverb']} | granular {meta['granular_used']} | "
+        f"k:{meta['kicks']} h:{meta['hats']} c:{meta['claps']}(+{meta['claps_deviant']}) | "
+        f"len {length_sec_out}s | sr {sr_out}Hz"
+    )
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(
+        description="Constant-speed chopper + kicks + sparse hats + optional clap + scheduled LP/BP on chops."
+    )
+    parser.add_argument("input_file", help="Input audio file")
+    parser.add_argument("--bpm", type=int, default=120, help="Tempo (default 120)")
+    parser.add_argument("--rate", type=float, default=1.0, help="Playback rate (0.1..2.0) for BACKING CHOPS ONLY; kick/hat/clap unaffected.")
+    parser.add_argument("--reverb", type=float, default=1.0, help="Glue reverb amount 0..2 (0 disables; 1 ≈ previous default).")
+    parser.add_argument("--speed", type=float, default=1.0, help="Global speed factor (default 1.0)")
+    parser.add_argument("--bars", type=int, default=None, help="Exact bars to render (default: auto 4..16)")
+    parser.add_argument("--subdiv", type=int, default=1, help="Chop grid per beat (1=quarters, 2=eighths, 4=sixteenths)")
+    parser.add_argument("--hat_density", type=float, default=0.60, help="Overall hat density (lower = sparser)")
+    parser.add_argument("--clap", action="store_true", help="Add claps on backbeats (every 2nd kick).")
+    parser.add_argument("--clap_dev_prob", type=float, default=0.10, help="Prob of bonus deviating clap per backbeat (0..1).")
+    parser.add_argument("--clap_dev_ms", type=float, default=22.0, help="Max abs deviation (ms) for bonus clap.")
+
+    args = parser.parse_args()
+    main(args.input_file, args.bpm, args.speed, args.rate, args.bars, args.subdiv,
+         args.hat_density, args.clap, args.clap_dev_prob, args.clap_dev_ms)
