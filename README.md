@@ -1,6 +1,6 @@
 # wavbeat
 
-Turns any audio file into a beat: legato grid chops from the source, optional hats/claps, resampling.
+Turns any audio file into a beat: legato grid chops from the source, optional hats/claps, automatic lowpass/highpass with resampling.
 
 ## Parameters
 
@@ -15,4 +15,5 @@ Turns any audio file into a beat: legato grid chops from the source, optional ha
 * `--clap` (flag): add claps on backbeats.
 * `--clap_dev_prob FLOAT` (default **0.10**): probability of bonus deviating clap (0..1).
 * `--clap_dev_ms FLOAT` (default **22.0**): max absolute deviation (ms) for bonus clap.
+
 
