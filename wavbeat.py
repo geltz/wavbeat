@@ -14,15 +14,15 @@ FILTER_WET = 1.0           # 0..1, blend amount for filtered signal
 FILTER_GLOBAL = None       # None | "lp" | "bp"  -> force a single LP/BP across ALL samples
 
 # Defaults for the forced-all filter (used when FILTER_GLOBAL != None)
-FILTER_LP_CUTOFF_HZ = 2600.0
+FILTER_LP_CUTOFF_HZ = 2900.0
 FILTER_BP_LOW_HZ = 200.0
-FILTER_BP_HIGH_HZ = 3600.0
+FILTER_BP_HIGH_HZ = 3900.0
 
 # One-shot loudness
 KICK_GAIN = 1.25
-HAT_GAIN = 1.20
-CLAP_GAIN = 1.25
-CLAP_DEV_GAIN = 0.85
+HAT_GAIN = 1.00
+CLAP_GAIN = 1.15
+CLAP_DEV_GAIN = 0.75
 
 # =========================
 # IO / Utility
@@ -148,16 +148,40 @@ def simple_reverb(x: np.ndarray, sr: int, mix=0.10, time_s=0.15, fb=0.28):
 def _db_to_lin(db: float) -> float:
     return float(10.0 ** (db / 20.0))
 
+def wider_glue_reverb(x: np.ndarray, sr: int, strength: float = 1.0) -> np.ndarray:
+    """
+    Fuller-band 'glue' reverb:
+    - Uses the existing simple_reverb engine to avoid tinny HF-only tails.
+    - Adds low-mid body to the wet via a broad band-pass blend.
+    'strength' ≈ your --reverb knob (0..2).
+    """
+    s = float(np.clip(strength, 0.0, 2.0))
+    mix   = np.clip(0.20 + 0.12 * s, 0.0, 0.48)   # wetter by default
+    time_s = 0.40 + 0.15 * min(s, 1.5)            # slightly larger room
+    fb    = 0.32 + 0.13 * min(s, 1.5)             # slightly longer decay
+
+    # get a 100% wet tail, then shape it and blend ourselves
+    wet_only = simple_reverb(x, sr, mix=1.0, time_s=time_s, fb=fb)
+
+    # add body to the wet (broad low-mid emphasis) to avoid 'tinny' feel
+    body = _butter_bp(wet_only, sr, low=120.0, high=3800.0, order=3)
+    wet_shaped = 0.70 * wet_only + 0.30 * body
+
+    y = (1.0 - mix) * x.astype(np.float64) + mix * wet_shaped.astype(np.float64)
+    peak = float(np.max(np.abs(y)) + 1e-12)
+    if peak > 1.0:
+        y /= peak
+    return y.astype(np.float32)
 
 def wider_glue_reverb_wet(x: np.ndarray, sr: int, strength: float = 1.0) -> np.ndarray:
     """100% wet version of wider_glue_reverb (no dry), for bus sends."""
     s = float(np.clip(strength, 0.0, 2.0))
-    time_s = 0.38 + 0.14 * min(s, 1.5)
-    fb = 0.30 + 0.12 * min(s, 1.5)
+    time_s = 0.40 + 0.15 * min(s, 1.5)
+    fb     = 0.32 + 0.13 * min(s, 1.5)
 
     wet_only = simple_reverb(x, sr, mix=1.0, time_s=time_s, fb=fb)
     body = _butter_bp(wet_only, sr, low=120.0, high=3800.0, order=3)
-    wet_shaped = 0.70 * wet_only + 0.30 * body
+    wet_shaped = 0.65 * wet_only + 0.35 * body
     return wet_shaped.astype(np.float32)
 
 
@@ -416,30 +440,6 @@ def build_converging_looped_chops(
     return looped, out_len, granular_used
 
 
-def wider_glue_reverb(x: np.ndarray, sr: int, strength: float = 1.0) -> np.ndarray:
-    """
-    Fuller-band 'glue' reverb:
-    - Uses the existing simple_reverb engine to avoid tinny HF-only tails.
-    - Adds low-mid body to the wet via a broad band-pass blend.
-    'strength' ≈ your --reverb knob (0..2).
-    """
-    s = float(np.clip(strength, 0.0, 2.0))
-    mix = np.clip(0.16 + 0.10 * s, 0.0, 0.40)          # wet/dry
-    time_s = 0.38 + 0.14 * min(s, 1.5)                 # size
-    fb = 0.30 + 0.12 * min(s, 1.5)                     # decay/room
-
-    # get a 100% wet tail, then shape it and blend ourselves
-    wet_only = simple_reverb(x, sr, mix=1.0, time_s=time_s, fb=fb)
-
-    # add body to the wet (broad low-mid emphasis) to avoid 'tinny' feel
-    body = _butter_bp(wet_only, sr, low=120.0, high=3800.0, order=3)
-    wet_shaped = 0.70 * wet_only + 0.30 * body
-
-    y = (1.0 - mix) * x.astype(np.float64) + mix * wet_shaped.astype(np.float64)
-    peak = float(np.max(np.abs(y)) + 1e-12)
-    if peak > 1.0:
-        y /= peak
-    return y.astype(np.float32)
 
 # =========================
 # Slice library + rhythmic scheduler (constant-speed chops)
@@ -1135,11 +1135,11 @@ def process(input_file: str, bpm: int = 120, speed: float = 1.0,
             claps_dev = int(len(c_dev))
 
     # >>> tiny mix-bus glue reverb (post layering, pre speed/normalize)
-    layered = apply_bus_glue_reverb(layered, sr, send=0.25, return_db=-12.0, strength=1.0)
+    layered = apply_bus_glue_reverb(layered, sr, send=0.28, return_db=-11.0, strength=1.0)
 
     # Global speed still affects the whole mix (tempo/pitch)
     final = resample_speed(layered, speed)
-    final = apply_bus_glue_reverb(final, sr, send=0.10, return_db=-12.0, strength=1.0)
+    final = apply_bus_glue_reverb(final, sr, send=0.12, return_db=-11.0, strength=1.0)
     final = normalize(np.tanh(final * 1.04), 0.98)
 
     meta = {
