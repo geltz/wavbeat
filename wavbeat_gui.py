@@ -125,119 +125,130 @@ class WavbeatGUI:
         self._build_ui()
     
     def _build_ui(self):
-        # Main container with gradient background
-        main = GradientFrame(self.root, color1=self.bg, color2="#F0F0FF", highlightthickness=0, bg=self.bg)
-        main.pack(fill=tk.BOTH, expand=True)
-        
-        # Title with gradient text
-        title_canvas = GradientText(main, "wavbeat", (self.font_family, 28, "bold"),
-                                    self.grad_start, self.grad_end, bg=self.bg, 
-                                    highlightthickness=0)
-        main.create_window(270, 30, window=title_canvas, width=250, height=44)
+            # Main container with gradient background
+            main = GradientFrame(self.root, color1=self.bg, color2="#F0F0FF", highlightthickness=0, bg=self.bg)
+            main.pack(fill=tk.BOTH, expand=True)
+            
+            # Title with gradient text
+            title_canvas = GradientText(main, "wavbeat", (self.font_family, 28, "bold"),
+                                        self.grad_start, self.grad_end, bg=self.bg, 
+                                        highlightthickness=0)
+            main.create_window(270, 30, window=title_canvas, width=250, height=44)
 
-        # Drop zone
-        self.drop_frame = tk.Frame(main, bg=self.drop_bg,
-                                   highlightbackground=self.accent,
-                                   highlightthickness=1)  # was 2 (thinner)
-        main.create_window(270, 135, window=self.drop_frame, width=460, height=150)
+            # Drop zone
+            self.drop_frame = tk.Frame(main, bg=self.drop_bg,
+                                       highlightbackground=self.accent,
+                                       highlightthickness=1)
+            main.create_window(270, 135, window=self.drop_frame, width=460, height=150)
 
-        drop_label = tk.Label(self.drop_frame,
-                              text="drag audio file here\n(or click to browse)",
-                              font=(self.font_family, 12), bg=self.drop_bg, fg="#6A5ACD",
-                              cursor="hand2")
-        drop_label.pack(expand=True, fill=tk.BOTH)
-        drop_label.bind("<Button-1>", lambda e: self._browse_file())
+            # --- AESTHETIC CHANGE: Made drop-zone text larger and added icon ---
+            drop_label = tk.Label(self.drop_frame,
+                                  text="♫\ndrag audio file here\n(or click to browse)",
+                                  font=(self.font_family, 14), bg=self.drop_bg, fg="#6A5ACD",
+                                  cursor="hand2")
+            drop_label.pack(expand=True, fill=tk.BOTH)
+            drop_label.bind("<Button-1>", lambda e: self._browse_file())
 
-        # Register drop target
-        self.drop_frame.drop_target_register(tkdnd.DND_FILES)
-        self.drop_frame.dnd_bind('<<Drop>>', self._on_drop)
+            # Register drop target
+            self.drop_frame.drop_target_register(tkdnd.DND_FILES)
+            self.drop_frame.dnd_bind('<<Drop>>', self._on_drop)
 
-        
-        # Status Label
-        self.status_label = tk.Label(main, text="ready", 
-                                     font=(self.font_family, 9), 
-                                     bg="#F0F0FF", fg="#666")
-        main.create_window(270, 220, window=self.status_label)
-        
-        # Parameters frame
-        param_frame = tk.Frame(main, bg=self.bg)
-        main.create_window(270, 420, window=param_frame, width=460)
+            
+            # Status Label
+            self.status_label = tk.Label(main, text="ready", 
+                                         font=(self.font_family, 9), 
+                                         bg="#F0F0FF", fg="#666")
+            main.create_window(270, 220, window=self.status_label)
+            
+            # Parameters frame
+            param_frame = tk.Frame(main, bg=self.bg)
+            main.create_window(270, 420, window=param_frame, width=460)
 
-        # Parameters
-        self.params = {}
+            # --- AESTHETIC CHANGE: Use .grid() layout for clean columns ---
+            # Configure grid columns for alignment
+            # Column 0: Label
+            # Column 1: Slider (expands)
+            # Column 2: Value
+            param_frame.columnconfigure(0, weight=2, uniform="params")
+            param_frame.columnconfigure(1, weight=3, uniform="params")
+            param_frame.columnconfigure(2, weight=1, uniform="params")
 
-        # Use REAL min/max + step; show true values; snap to step in a callback
-        configs = [
-            ("BPM", "bpm", 120, 60, 200, 1),
-            ("Speed", "speed", 1.0, 0.5, 2.0, 0.1),
-            ("Rate (chops)", "rate", 1.0, 0.1, 2.0, 0.1),
-            ("Reverb", "reverb", 1.0, 0.0, 2.0, 0.1),
-            ("Bars", "bars", 8, 1, 32, 1),
-            ("Subdiv", "subdiv", 1, 1, 8, 1),
-            ("Hat Density", "hat_density", 0.60, 0.0, 1.0, 0.05),
-            ("Clap Dev Prob", "clap_dev_prob", 0.10, 0.0, 1.0, 0.05),
-            ("Clap Dev (ms)", "clap_dev_ms", 22.0, 0.0, 100.0, 1.0),
-        ]
+            # Parameters
+            self.params = {}
 
-        for i, (label, key, default, min_val, max_val, step) in enumerate(configs):
-            row = tk.Frame(param_frame, bg=self.bg)
-            row.pack(fill=tk.X, pady=4)
+            configs = [
+                ("bpm", "bpm", 120, 60, 200, 1),
+                ("speed", "speed", 1.0, 0.5, 2.0, 0.1),
+                ("rate (chops)", "rate", 1.0, 0.1, 2.0, 0.1),
+                # --- REVERB CHANGE: Default changed from 1.0 to 1.2 ---
+                ("reverb", "reverb", 1.2, 0.0, 2.0, 0.1),
+                ("bars", "bars", 8, 1, 32, 1),
+                ("subdiv", "subdiv", 1, 1, 8, 1),
+                ("hat density", "hat_density", 0.60, 0.0, 1.0, 0.05),
+                ("clap dev prob", "clap_dev_prob", 0.10, 0.0, 1.0, 0.05),
+                ("clap dev (ms)", "clap_dev_ms", 22.0, 0.0, 100.0, 1.0),
+            ]
 
-            lbl = tk.Label(row, text=label, font=(self.font_family, 10),
-                           bg=self.bg, fg=self.fg, width=15, anchor="w")
-            lbl.pack(side=tk.LEFT, padx=(0, 10))
+            for i, (label, key, default, min_val, max_val, step) in enumerate(configs):
+                # --- LAYOUT CHANGE: Removed intermediary 'row' frame ---
 
-            # Store metadata
-            self.param_ranges[key] = {'min': min_val, 'max': max_val}
-            self.param_steps[key] = step
-            self.param_is_int[key] = isinstance(default, int)
+                # Store metadata
+                self.param_ranges[key] = {'min': min_val, 'max': max_val}
+                self.param_steps[key] = step
+                self.param_is_int[key] = isinstance(default, int)
 
-            # Use DoubleVar and real ranges
-            var = tk.DoubleVar(value=float(default))
-            self.params[key] = var
+                # Use DoubleVar and real ranges
+                var = tk.DoubleVar(value=float(default))
+                self.params[key] = var
 
-            # Build scale with true range; snap/clamp via command callback
-            scale = ttk.Scale(row, from_=min_val, to=max_val,
-                              variable=var, orient=tk.HORIZONTAL, length=220,
-                              command=lambda _val, k=key: self._on_slider(k))
-            scale.pack(side=tk.LEFT)
+                # --- LAYOUT CHANGE: Place label in grid column 0 ---
+                lbl = tk.Label(param_frame, text=label, font=(self.font_family, 10),
+                               bg=self.bg, fg=self.fg, anchor="w")
+                lbl.grid(row=i, column=0, sticky="w", padx=(0, 10), pady=5)
 
-            # Nicely formatted live value label
-            sval = tk.StringVar()
-            self.param_label_vars[key] = sval
-            tk.Label(row, textvariable=sval, font=(self.font_family, 9),
-                     bg=self.bg, fg="#6A5ACD", width=8).pack(side=tk.LEFT, padx=(10, 0))
+                # --- LAYOUT CHANGE: Place scale in grid column 1 ---
+                scale = ttk.Scale(param_frame, from_=min_val, to=max_val,
+                                  variable=var, orient=tk.HORIZONTAL,
+                                  command=lambda _val, k=key: self._on_slider(k))
+                scale.grid(row=i, column=1, sticky="ew", padx=5, pady=5) # 'ew' = expand horizontally
 
-        # Clap toggle (unchanged)
-        clap_row = tk.Frame(param_frame, bg=self.bg)
-        clap_row.pack(fill=tk.X, pady=4)
-        self.clap_var = tk.BooleanVar(value=False)
-        clap_cb = tk.Checkbutton(clap_row, text="Enable Claps",
-                                 variable=self.clap_var,
-                                 font=(self.font_family, 10),
-                                 bg=self.bg, fg=self.fg,
-                                 selectcolor=self.drop_bg,
-                                 activebackground=self.bg,
-                                 activeforeground=self.fg,
-                                 bd=0,
-                                 highlightthickness=0)
-        clap_cb.pack(anchor="w")
+                # --- LAYOUT CHANGE: Place value label in grid column 2 ---
+                sval = tk.StringVar()
+                self.param_label_vars[key] = sval
+                val_label = tk.Label(param_frame, textvariable=sval, font=(self.font_family, 9),
+                                     bg=self.bg, fg="#6A5ACD", width=8, anchor="e")
+                val_label.grid(row=i, column=2, sticky="e", padx=(10, 0), pady=5) # 'e' = align right
 
-        # Style for sliders (kept)
-        style = ttk.Style()
-        style.theme_use('clam')
-        style.configure("Horizontal.TScale",
-                        background=self.bg,
-                        troughcolor="#F0F0FF",
-                        borderwidth=0,
-                        lightcolor=self.accent,
-                        darkcolor=self.accent,
-                        sliderlength=20)
-        style.map("Horizontal.TScale", background=[('active', self.bg)])
+            # --- LAYOUT CHANGE: Place clap toggle on the grid ---
+            next_row = len(configs)
+            self.clap_var = tk.BooleanVar(value=False)
+            clap_cb = tk.Checkbutton(param_frame, text="enable claps",
+                                     variable=self.clap_var,
+                                     font=(self.font_family, 10),
+                                     bg=self.bg, fg=self.fg,
+                                     selectcolor=self.drop_bg,
+                                     activebackground=self.bg,
+                                     activeforeground=self.fg,
+                                     bd=0,
+                                     highlightthickness=0,
+                                     anchor="w")
+            clap_cb.grid(row=next_row, column=0, columnspan=2, sticky="w", pady=5)
 
-        # Initialize labels once everything exists
-        for key in self.params.keys():
-            self._on_slider(key)
+            # Style for sliders (unchanged)
+            style = ttk.Style()
+            style.theme_use('clam')
+            style.configure("Horizontal.TScale",
+                            background=self.bg,
+                            troughcolor="#F0F0FF",
+                            borderwidth=0,
+                            lightcolor=self.accent,
+                            darkcolor=self.accent,
+                            sliderlength=20)
+            style.map("Horizontal.TScale", background=[('active', self.bg)])
+
+            # Initialize labels once everything exists
+            for key in self.params.keys():
+                self._on_slider(key)
 
 
     def _format_val(self, key, val):

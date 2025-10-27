@@ -247,11 +247,15 @@ def granular_synthesis(audio, sr, intensity=0.12):
 # =========================
 
 def _butter_hp(x, sr, cutoff=9000.0, order=5):
-    b, a = signal.butter(order, cutoff / (0.5 * sr), btype='highpass')
+    # Clamp cutoff to be safely below Nyquist frequency (0.5 * sr)
+    safe_cutoff = min(float(cutoff), 0.49 * sr)
+    b, a = signal.butter(order, safe_cutoff / (0.5 * sr), btype='highpass')
     return signal.lfilter(b, a, x)
 
 def _butter_lp(x, sr, cutoff=140.0, order=4):
-    b, a = signal.butter(order, cutoff / (0.5 * sr), btype='lowpass')
+    # Clamp cutoff to be safely below Nyquist frequency (0.5 * sr)
+    safe_cutoff = min(float(cutoff), 0.49 * sr)
+    b, a = signal.butter(order, safe_cutoff / (0.5 * sr), btype='lowpass')
     return signal.lfilter(b, a, x)
 
 def make_kick_from_slice(x, sr):
@@ -611,9 +615,8 @@ def make_small_slices_low_peak(x: np.ndarray, sr: int, count: int = 64,
 
 def _overlap_add_legato(out: np.ndarray, seg: np.ndarray, start: int, xfade: int) -> None:
     """
-    Writes seg into out starting at 'start', using an equal-power crossfade
-    (linear-in / linear-out) over 'xfade' samples to avoid gaps/clicks.
-    Modifies 'out' in-place.
+    Equal-power crossfade with RMS matching at the seam.
+    Reduces level dips/bumps vs linear ramps.
     """
     L = len(out)
     if start >= L:
@@ -624,25 +627,33 @@ def _overlap_add_legato(out: np.ndarray, seg: np.ndarray, start: int, xfade: int
     if seg_len <= 0:
         return
 
-    # Crossfade with previous content
     cross = min(xfade, seg_len, start)
     if cross > 0:
-        fo = np.linspace(1.0, 0.0, cross)   # fade-out for existing tail
-        fi = 1.0 - fo                       # fade-in for new seg
-        out[start - cross:start] = (
-            out[start - cross:start].astype(np.float64) * fo +
-            seg[:cross] * fi
-        )
-        w_start = start + 0
+        # equal-power ramps
+        t = np.linspace(0.0, 1.0, cross, endpoint=True)
+        fo = np.cos(0.5 * np.pi * t)   # fade-out old
+        fi = np.sin(0.5 * np.pi * t)   # fade-in new
+
+        a = out[start - cross:start].astype(np.float64)
+        b = seg[:cross].astype(np.float64)
+
+        # match RMS in overlap to minimize audibility
+        ra = np.sqrt((a * a).mean() + 1e-12)
+        rb = np.sqrt((b * b).mean() + 1e-12)
+        if rb > 0.0:
+            b = b * (ra / rb)
+
+        out[start - cross:start] = a * fo + b * fi
+        w_start = start
         s_off = cross
     else:
         w_start = start
         s_off = 0
 
-    # Write the rest
     remain = seg_len - (w_start - start) - s_off
     if remain > 0:
         out[w_start:w_start + remain] += seg[s_off:s_off + remain]
+
 
 def _stitch_to_len_legato(slice_lib, target_len, sr, xfade_ms=12):
     """
@@ -661,12 +672,16 @@ def _stitch_to_len_legato(slice_lib, target_len, sr, xfade_ms=12):
         pos += len(seg_use)
     return out
 
-def place_slices_on_grid_constant_speed(slice_lib, sr, bpm, bars=8, subdiv=2,
-                                        density=0.65, allow_double=True,
-                                        start_jitter=0.02, granular_chance=0.01):
+def place_slices_legato_on_grid_constant_speed(slice_lib, sr, bpm, bars=8, subdiv=2,
+                                               density=0.6, allow_double=True,
+                                               granular_chance=0.01, xfade_ms=12,
+                                               apply_reverb=False, reverb_amount=1.0):
     """
-    Lay slices ON the grid with constant slice speed (no per-slice resampling).
-    Each placed slice length is exactly 1x or 2x grid; we crop/pad to fit.
+    Legato version: slices are back-to-back with a small crossfade; no silent gaps.
+    - Lengths are exact multiples of the grid (1x or 2x), so groove stays locked.
+    - 'density' steers how often we choose 1x (dense) vs 2x (more sustained).
+      (p_1x = density, p_2x = 1 - density)
+    - Optional global reverb applied to entire output as post-process.
     """
     assert subdiv >= 1
     beat_samps = int(sr * 60.0 / bpm)
@@ -677,15 +692,16 @@ def place_slices_on_grid_constant_speed(slice_lib, sr, bpm, bars=8, subdiv=2,
 
     rng = np.random.default_rng()
     granular_used = 0
+    xfade = max(0, int((xfade_ms / 1000.0) * sr))
 
-    for cell_idx, base_pos in enumerate(range(0, out_len, grid)):
-        if rng.random() > density:
-            continue
-
-        # choose 1x or 2x grid fixed length (no time-scaling)
-        use_double = allow_double and (rng.random() < 0.15)
+    cursor = 0
+    while cursor < out_len:
+        # choose 1x or 2x grid; keep all starts on-grid by construction
+        use_double = allow_double and (rng.random() > density)
         target_len = grid * (2 if use_double else 1)
+        target_len = min(target_len, out_len - max(0, cursor - xfade))
 
+        # Stitch multiple source slices to fill the cell EXACTLY, no padding ‚Üí true legato
         seg = _stitch_to_len_legato(slice_lib, target_len, sr, xfade_ms=xfade_ms)
 
         # rare, gentle granular on the stitched segment (length unchanged)
@@ -693,16 +709,17 @@ def place_slices_on_grid_constant_speed(slice_lib, sr, bpm, bars=8, subdiv=2,
             seg = granular_synthesis(seg, sr, intensity=0.12)
             granular_used += 1
 
-        # small start jitter for feel (does not change slice length)
-        jitter = int(grid * start_jitter * rng.uniform(-1.0, 1.0))
-        pos = np.clip(base_pos + jitter, 0, out_len - 1)
-        end = min(out_len, pos + len(seg))
-        out[pos:end] += seg[:end - pos]
+        # Legato write: start at (cursor - xfade) to overlap smoothly
+        start = max(0, cursor - xfade)
+        _overlap_add_legato(out, seg, start, xfade)
 
-    # limit
-    peak = np.max(np.abs(out))
-    if peak > 1.0:
-        out /= peak
+        cursor = start + len(seg)
+
+    # Apply global reverb if requested (before final normalize)
+    if apply_reverb and reverb_amount > 0.0:
+        # === replaced broken reverb with the script's working reverb ===
+        out = wider_glue_reverb(out, sr, strength=reverb_amount)
+    
     return out.astype(np.float32), out_len, granular_used
 
 def place_slices_legato_on_grid_constant_speed(slice_lib, sr, bpm, bars=8, subdiv=2,
