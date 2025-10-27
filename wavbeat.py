@@ -68,6 +68,10 @@ def resample_speed(x: np.ndarray, speed: float):
     y = signal.resample_poly(x, up, down)
     return y.astype(np.float32)
 
+# =========================
+# Reverb (VERY SUBTLE)
+# =========================
+
 def simple_reverb(x: np.ndarray, sr: int, mix=0.10, time_s=0.15, fb=0.28):
     """
     Plate-style reverb (Freeverb-ish) using an impulse-response built from:
@@ -199,6 +203,23 @@ def apply_bus_glue_reverb(mix: np.ndarray, sr: int, *, send=0.08, return_db=-12.
     if peak > 1.0:
         y /= peak
     return y.astype(np.float32)
+
+def apply_global_loop_reverb(chop_track: np.ndarray, sr: int, *,
+                             wet_db: float = -6.0,
+                             strength: float = 1.3,
+                             tail_secs: float = 0.0) -> np.ndarray:
+    """Global reverb for the whole backing loop, with optional end ring-out."""
+    dry = chop_track.astype(np.float64)
+    pad = np.zeros(int(max(0.0, tail_secs) * sr), dtype=np.float64)
+    dry_padded = np.concatenate([dry, pad])
+
+    wet = wider_glue_reverb_wet(dry_padded.astype(np.float32), sr, strength=strength).astype(np.float64)
+    out = dry_padded + _db_to_lin(wet_db) * wet
+
+    peak = float(np.max(np.abs(out)) + 1e-12)
+    if peak > 1.0:
+        out /= peak
+    return out.astype(np.float32)
 
 # =========================
 # Very light granular (texture only)
@@ -1088,8 +1109,8 @@ def process(input_file: str, bpm: int = 120, speed: float = 1.0,
         allow_double=True, granular_chance=0.01, xfade_ms=30
     )
 
-    # Fuller-band glue verb on chops (static; won't break the loop identity)
-    chop_track = wider_glue_reverb(chop_track, sr, strength=reverb)
+    # Fuller-band glue verb on looped chops (static; won't break the loop identity)
+    chop_track = apply_global_loop_reverb(chop_track, sr, wet_db=-3.0, strength=reverb, tail_secs=1.0)
 
     # keep loop identical; disable time-varying filter schedules on chops
     # chop_track = apply_random_filter_schedules(chop_track, sr, bpm, bars, subdiv)
@@ -1135,11 +1156,11 @@ def process(input_file: str, bpm: int = 120, speed: float = 1.0,
             claps_dev = int(len(c_dev))
 
     # >>> tiny mix-bus glue reverb (post layering, pre speed/normalize)
-    layered = apply_bus_glue_reverb(layered, sr, send=0.28, return_db=-11.0, strength=1.0)
+    layered = apply_bus_glue_reverb(layered, sr, send=0.90, return_db=-6.0, strength=1.5)
 
     # Global speed still affects the whole mix (tempo/pitch)
     final = resample_speed(layered, speed)
-    final = apply_bus_glue_reverb(final, sr, send=0.12, return_db=-11.0, strength=1.0)
+    final = apply_bus_glue_reverb(final, sr, send=0.90, return_db=-11.0, strength=1.5)
     final = normalize(np.tanh(final * 1.04), 0.98)
 
     meta = {
