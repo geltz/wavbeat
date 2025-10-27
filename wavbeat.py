@@ -139,12 +139,42 @@ def simple_reverb(x: np.ndarray, sr: int, mix=0.10, time_s=0.15, fb=0.28):
     # FFT convolution (efficient for long tails)
     y = signal.fftconvolve(x64, ir, mode="full")[:len(x64)]
 
-    # wet/dry + gentle safety drive
+    # wet/dry blend WITHOUT tanh
     wet = float(np.clip(mix, 0.0, 1.0))
     out = (1.0 - wet) * x64 + wet * y
-    out = np.tanh(out * 1.05)
 
     return out.astype(np.float32)
+
+def _db_to_lin(db: float) -> float:
+    return float(10.0 ** (db / 20.0))
+
+
+def wider_glue_reverb_wet(x: np.ndarray, sr: int, strength: float = 1.0) -> np.ndarray:
+    """100% wet version of wider_glue_reverb (no dry), for bus sends."""
+    s = float(np.clip(strength, 0.0, 2.0))
+    time_s = 0.38 + 0.14 * min(s, 1.5)
+    fb = 0.30 + 0.12 * min(s, 1.5)
+
+    wet_only = simple_reverb(x, sr, mix=1.0, time_s=time_s, fb=fb)
+    body = _butter_bp(wet_only, sr, low=120.0, high=3800.0, order=3)
+    wet_shaped = 0.70 * wet_only + 0.30 * body
+    return wet_shaped.astype(np.float32)
+
+
+def apply_bus_glue_reverb(mix: np.ndarray, sr: int, *, send=0.08, return_db=-12.0, strength=1.0) -> np.ndarray:
+    """
+    Small reverb send on the stereo bus.
+    Increase 'send' a hair (e.g., 0.08 -> 0.10) for a little more verb.
+    """
+    dry = mix.astype(np.float32)
+    aux_in = (dry * float(np.clip(send, 0.0, 1.0))).astype(np.float32)
+    aux_wet = wider_glue_reverb_wet(aux_in, sr, strength=strength)
+
+    y = dry.astype(np.float64) + _db_to_lin(return_db) * aux_wet.astype(np.float64)
+    peak = float(np.max(np.abs(y)) + 1e-12)
+    if peak > 1.0:
+        y /= peak
+    return y.astype(np.float32)
 
 # =========================
 # Very light granular (texture only)
@@ -216,7 +246,7 @@ def granular_synthesis(audio, sr, intensity=0.12):
 # One-shots (kick / hat)
 # =========================
 
-def _butter_hp(x, sr, cutoff=7000.0, order=4):
+def _butter_hp(x, sr, cutoff=9000.0, order=5):
     b, a = signal.butter(order, cutoff / (0.5 * sr), btype='highpass')
     return signal.lfilter(b, a, x)
 
@@ -243,24 +273,24 @@ def make_hat_variants_from_slice(x, sr):
     if len(x) == 0:
         return x, x
     # Closed
-    c_dur = int(np.random.uniform(0.035, 0.06) * sr)
+    c_dur = int(np.random.uniform(0.028, 0.050) * sr)
     c = x[:c_dur].astype(np.float64)
-    c = _butter_hp(c, sr, cutoff=np.random.uniform(7000.0, 9500.0))
+    c = _butter_hp(c, sr, cutoff=np.random.uniform(9500.0, 12000.0))
     t = np.linspace(0.0, 1.0, len(c))
-    c *= np.exp(-13.0 * t)
+    c *= np.exp(-16.0 * t)
     if len(c) > 8:
-        k = np.random.randint(2, 4)
+        k = np.random.randint(3, 5)
         c = signal.resample(c[::k], len(c))
     c /= (np.max(np.abs(c)) + 1e-9)
 
     # Open (longer, breathier)
-    o_dur = int(np.random.uniform(0.09, 0.14) * sr)
+    o_dur = int(np.random.uniform(0.075, 0.120) * sr)
     o = x[:o_dur].astype(np.float64)
-    o = _butter_hp(o, sr, cutoff=np.random.uniform(6000.0, 8500.0))
+    o = _butter_hp(o, sr, cutoff=np.random.uniform(8500.0, 11000.0))
     t = np.linspace(0.0, 1.0, len(o))
-    o *= np.exp(-7.0 * t)
+    o *= np.exp(-9.0 * t)
     if len(o) > 8:
-        k = np.random.randint(2, 3)
+        k = np.random.randint(2, 4)
         o = signal.resample(o[::k], len(o))
     o /= (np.max(np.abs(o)) + 1e-9)
 
@@ -313,6 +343,99 @@ def generate_sparse_shuffled_hat_events(sr, bpm, length_samples,
                 gain = (0.38 + 0.45 * rng.random()) * (1.2 if is_open else 1.0)
                 events.append((pos, is_open, float(gain)))
     return events
+
+def _tile_repeat(x: np.ndarray, total_len: int) -> np.ndarray:
+    """Tile 1D array to at least total_len and crop."""
+    reps = int(np.ceil(total_len / max(1, len(x))))
+    return np.tile(x, reps)[:total_len].astype(np.float32)
+
+
+def build_converging_looped_chops(
+    slice_lib, sr, bpm, *, bars=8, subdiv=2, density=0.6,
+    allow_double=True, granular_chance=0.01, xfade_ms=12,
+    loop_bars=2, converge_bars=2
+):
+    """
+    1) Build a 2-bar (configurable) MOTIF of legato chops.
+    2) Tile that motif across the song.
+    3) Optionally crossfade the first N bars from a 'free' random take into the loop.
+    """
+    assert subdiv >= 1
+    beat_samps = int(sr * 60.0 / bpm)
+    grid = beat_samps // subdiv
+
+    # song + motif lengths
+    bars = max(loop_bars, int(bars))
+    out_len = 4 * bars * beat_samps
+    motif_len = 4 * loop_bars * beat_samps
+
+    rng = np.random.default_rng()
+    xfade = max(0, int((xfade_ms / 1000.0) * sr))
+    granular_used = 0
+
+    # --- build motif ---
+    motif = np.zeros(motif_len, dtype=np.float32)
+    cursor = 0
+    while cursor < motif_len:
+        use_double = allow_double and (rng.random() > density)
+        target_len = grid * (2 if use_double else 1)
+        target_len = min(target_len, motif_len - max(0, cursor - xfade))
+
+        seg = _stitch_to_len_legato(slice_lib, target_len, sr, xfade_ms=xfade_ms)
+
+        if rng.random() < granular_chance and len(seg) > int(0.04 * sr):
+            seg = granular_synthesis(seg, sr, intensity=0.12)
+            granular_used += 1
+
+        start = max(0, cursor - xfade)
+        _overlap_add_legato(motif, seg, start, xfade)
+        cursor = start + len(seg)
+
+    # --- tile motif across song ---
+    looped = _tile_repeat(motif, out_len)
+
+    # --- random converge: crossfade first 'converge_bars' into the loop ---
+    cb = int(max(0, converge_bars))
+    if cb > 0:
+        free, _, g2 = place_slices_legato_on_grid_constant_speed(
+            slice_lib, sr, bpm, bars=bars, subdiv=subdiv, density=density,
+            allow_double=allow_double, granular_chance=granular_chance,
+            xfade_ms=xfade_ms, apply_reverb=False, reverb_amount=0.0
+        )
+        cf_len = min(out_len, 4 * cb * beat_samps)
+        ramp = np.linspace(0.0, 1.0, cf_len, endpoint=True).astype(np.float64)
+        y = looped.astype(np.float64)
+        y[:cf_len] = free[:cf_len].astype(np.float64) * (1.0 - ramp) + y[:cf_len] * ramp
+        looped = y.astype(np.float32)
+        granular_used += g2
+
+    return looped, out_len, granular_used
+
+
+def wider_glue_reverb(x: np.ndarray, sr: int, strength: float = 1.0) -> np.ndarray:
+    """
+    Fuller-band 'glue' reverb:
+    - Uses the existing simple_reverb engine to avoid tinny HF-only tails.
+    - Adds low-mid body to the wet via a broad band-pass blend.
+    'strength' ≈ your --reverb knob (0..2).
+    """
+    s = float(np.clip(strength, 0.0, 2.0))
+    mix = np.clip(0.16 + 0.10 * s, 0.0, 0.40)          # wet/dry
+    time_s = 0.38 + 0.14 * min(s, 1.5)                 # size
+    fb = 0.30 + 0.12 * min(s, 1.5)                     # decay/room
+
+    # get a 100% wet tail, then shape it and blend ourselves
+    wet_only = simple_reverb(x, sr, mix=1.0, time_s=time_s, fb=fb)
+
+    # add body to the wet (broad low-mid emphasis) to avoid 'tinny' feel
+    body = _butter_bp(wet_only, sr, low=120.0, high=3800.0, order=3)
+    wet_shaped = 0.70 * wet_only + 0.30 * body
+
+    y = (1.0 - mix) * x.astype(np.float64) + mix * wet_shaped.astype(np.float64)
+    peak = float(np.max(np.abs(y)) + 1e-12)
+    if peak > 1.0:
+        y /= peak
+    return y.astype(np.float32)
 
 # =========================
 # Slice library + rhythmic scheduler (constant-speed chops)
@@ -584,12 +707,14 @@ def place_slices_on_grid_constant_speed(slice_lib, sr, bpm, bars=8, subdiv=2,
 
 def place_slices_legato_on_grid_constant_speed(slice_lib, sr, bpm, bars=8, subdiv=2,
                                                density=0.6, allow_double=True,
-                                               granular_chance=0.01, xfade_ms=12):
+                                               granular_chance=0.01, xfade_ms=12,
+                                               apply_reverb=False, reverb_amount=1.0):
     """
     Legato version: slices are back-to-back with a small crossfade; no silent gaps.
     - Lengths are exact multiples of the grid (1x or 2x), so groove stays locked.
     - 'density' steers how often we choose 1x (dense) vs 2x (more sustained).
       (p_1x = density, p_2x = 1 - density)
+    - Optional global reverb applied to entire output as post-process.
     """
     assert subdiv >= 1
     beat_samps = int(sr * 60.0 / bpm)
@@ -623,10 +748,45 @@ def place_slices_legato_on_grid_constant_speed(slice_lib, sr, bpm, bars=8, subdi
 
         cursor = start + len(seg)
 
-    # protect headroom
-    peak = float(np.max(np.abs(out)))
-    if peak > 1.0:
-        out /= peak
+    # Apply global reverb if requested (before final normalize)
+    if apply_reverb and reverb_amount > 0.0:
+        r = float(np.clip(reverb_amount, 0.0, 2.0))
+        
+        # Schroeder reverb (direct implementation, no IR)
+        wet_amt = 0.25 * r
+        rt60 = 1.25 * r  # decay time in seconds
+        
+        y = out.astype(np.float64).copy()
+        
+        # Comb filters (parallel)
+        comb_delays = [int(0.0297 * sr), int(0.0371 * sr), int(0.0411 * sr), int(0.0437 * sr)]
+        comb_out = np.zeros_like(y)
+        for delay in comb_delays:
+            g = 10 ** (-3 * delay / (rt60 * sr))  # decay coefficient
+            buf = np.zeros(delay)
+            temp = np.zeros_like(y)
+            for i in range(len(y)):
+                temp[i] = y[i] + g * buf[0]
+                buf = np.roll(buf, -1)
+                buf[-1] = temp[i]
+            comb_out += temp
+        comb_out /= len(comb_delays)
+        
+        # Allpass filters (serial)
+        ap_delays = [int(0.005 * sr), int(0.0017 * sr)]
+        ap_out = comb_out
+        for delay in ap_delays:
+            buf = np.zeros(delay)
+            temp = np.zeros_like(ap_out)
+            g = 0.7
+            for i in range(len(ap_out)):
+                temp[i] = -g * ap_out[i] + buf[0] + g * buf[0]
+                buf = np.roll(buf, -1)
+                buf[-1] = ap_out[i]
+            ap_out = temp
+        
+        out = ((1.0 - wet_amt) * out + wet_amt * ap_out).astype(np.float32)
+    
     return out.astype(np.float32), out_len, granular_used
 
 def _butter_bp(x, sr, low=900.0, high=3500.0, order=4):
@@ -644,23 +804,23 @@ def make_clap_from_slice(x, sr):
     if len(x) == 0:
         return x
     rng = np.random.default_rng()
-    dur = int(rng.uniform(0.09, 0.16) * sr)
+    dur = int(rng.uniform(0.065, 0.110) * sr)
     g = x[:dur].astype(np.float64)
 
-    # Core tone
-    lo = rng.uniform(800.0, 1200.0)
-    hi = rng.uniform(3000.0, 5000.0)
-    g = _butter_bp(g, sr, low=lo, high=hi, order=4)
+    # Core tone - thinner, brighter
+    lo = rng.uniform(1400.0, 1900.0)
+    hi = rng.uniform(5500.0, 7500.0)
+    g = _butter_bp(g, sr, low=lo, high=hi, order=5)
 
-    # Short decay + soft drive
+    # Faster decay + harder drive
     t = np.linspace(0.0, 1.0, len(g))
-    g *= np.exp(-9.0 * t)
-    g = np.tanh(1.6 * g)
+    g *= np.exp(-12.0 * t)
+    g = np.tanh(2.1 * g)
 
-    # Tiny flam (a couple early reflections)
+    # Tighter flam
     out = g.copy()
-    for w, ms in [(0.55, rng.uniform(3.0, 6.0)),
-                  (0.35, rng.uniform(7.0, 12.0))]:
+    for w, ms in [(0.42, rng.uniform(2.0, 4.0)),
+                  (0.28, rng.uniform(5.0, 8.0))]:
         d = int(ms * 1e-3 * sr)
         if d < len(g):
             tmp = np.zeros_like(g)
@@ -815,6 +975,67 @@ def mix_hat_events(base, hat_closed, hat_open, events, global_gain=1.0):
         out /= peak
     return out.astype(np.float32)
 
+def build_strict_looped_chops(
+    slice_lib, sr, bpm, *,
+    bars=8, subdiv=2, density=0.6,
+    loop_bars=2, converge_bars=2,
+    allow_double=True, granular_chance=0.0,
+    xfade_ms=12, rng=None
+):
+    """
+    Build ONE 2-bar motif and hard-tile it. Optional 'converge_bars' crossfades
+    only the FIRST bars from a free take into the loop; after that it's identical.
+    Returns (looped, out_len, granular_used).
+    """
+    import numpy as np
+
+    if rng is None:
+        rng = np.random.default_rng()
+
+    beat_samps = int(sr * 60.0 / bpm)
+    grid = max(1, beat_samps // max(1, subdiv))
+    bars = max(loop_bars, int(bars))
+    out_len = 4 * bars * beat_samps
+    motif_len = 4 * loop_bars * beat_samps
+    xfade = max(0, int((xfade_ms / 1000.0) * sr))
+
+    granular_used = 0
+
+    # --- make the motif (fixed content) ---
+    motif = np.zeros(motif_len, dtype=np.float32)
+    cursor = 0
+    while cursor < motif_len:
+        use_double = allow_double and (rng.random() > density)
+        target_len = min(grid * (2 if use_double else 1), motif_len - max(0, cursor - xfade))
+        seg = _stitch_to_len_legato(slice_lib, target_len, sr, xfade_ms=xfade_ms)
+        if granular_chance and rng.random() < granular_chance and len(seg) > int(0.04 * sr):
+            seg = granular_synthesis(seg, sr, intensity=0.12)
+            granular_used += 1
+        start = max(0, cursor - xfade)
+        _overlap_add_legato(motif, seg, start, xfade)
+        cursor = start + len(seg)
+
+    # --- hard-tile motif across song length ---
+    looped = _tile_repeat(motif, out_len)
+
+    # --- optional converge into the loop only at the very start ---
+    cb = max(0, int(converge_bars))
+    if cb > 0:
+        free, _, g2 = place_slices_legato_on_grid_constant_speed(
+            slice_lib, sr, bpm,
+            bars=bars, subdiv=subdiv, density=density,
+            allow_double=allow_double, granular_chance=granular_chance,
+            xfade_ms=xfade_ms, apply_reverb=False, reverb_amount=0.0
+        )
+        granular_used += g2
+        cf_len = min(out_len, 4 * cb * beat_samps)
+        ramp = np.linspace(0.0, 1.0, cf_len, endpoint=True).astype(np.float64)
+        y = looped.astype(np.float64)
+        y[:cf_len] = free[:cf_len].astype(np.float64) * (1.0 - ramp) + y[:cf_len] * ramp
+        looped = y.astype(np.float32)
+
+    return looped, out_len, granular_used
+
 # =========================
 # Main process
 # =========================
@@ -839,17 +1060,22 @@ def process(input_file: str, bpm: int = 120, speed: float = 1.0,
     chop_slice_lib = make_small_slices_low_peak(audio, sr, count=64, min_ms=300, max_ms=600)
     perc_slice_lib = make_small_slices(audio, sr, count=64, min_ms=300, max_ms=600)
 
-    # >>> Apply 'rate' to BACKING CHOPS ONLY (kick/hat/clap are unaffected)
+    # >>> Apply 'rate' (kick/hat/clap are unaffected)
     chop_slice_lib = _rate_slices(chop_slice_lib, rate)
 
-    # Quantized chop track (constant-speed, legato)
-    chop_track, out_len, granular_used = place_slices_legato_on_grid_constant_speed(
-        chop_slice_lib, sr, bpm, bars=bars, subdiv=subdiv, density=base_density,
+    # 2-bar looped chops
+    chop_track, out_len, granular_used = build_strict_looped_chops(
+        chop_slice_lib, sr, bpm,
+        bars=bars, subdiv=subdiv, density=base_density,
+        loop_bars=2, converge_bars=2,   # set to 0 for strict from bar 1
         allow_double=True, granular_chance=0.01, xfade_ms=30
     )
 
-    # Scheduled LP/BP on chops
-    chop_track = apply_random_filter_schedules(chop_track, sr, bpm, bars, subdiv)
+    # Fuller-band glue verb on chops (static; won't break the loop identity)
+    chop_track = wider_glue_reverb(chop_track, sr, strength=reverb)
+
+    # keep loop identical; disable time-varying filter schedules on chops
+    # chop_track = apply_random_filter_schedules(chop_track, sr, bpm, bars, subdiv)
 
     # One-shot percs from source (NOT rate-scaled)
     rng = np.random.default_rng()
@@ -870,7 +1096,7 @@ def process(input_file: str, bpm: int = 120, speed: float = 1.0,
         sr, bpm, out_len, base_density=hat_density, shuffle=shuffle_used, rng=rng
     )
 
-    # Layer percussion (kick + hat)
+    # Layer percussion (kick + hat) on top of reverbed chops
     layered = mix_one_shots(chop_track, kick, k_on, gain=KICK_GAIN)
     layered = mix_hat_events(layered, hat_closed, hat_open, hat_events, global_gain=HAT_GAIN)
 
@@ -891,16 +1117,12 @@ def process(input_file: str, bpm: int = 120, speed: float = 1.0,
             layered = mix_one_shots(layered, clap_one, c_dev, gain=CLAP_DEV_GAIN * CLAP_GAIN)
             claps_dev = int(len(c_dev))
 
-    # Glue reverb controlled by 0..2 knob (0 disables; 1 ≈ previous)
-    r = float(np.clip(reverb, 0.0, 2.0))
-    if r > 0.0:
-        mix    = 0.08 * r
-        time_s = 0.14 * (0.5 + 0.5 * r)  # scales size gently
-        fb     = 0.26 * (0.5 + 0.5 * r)  # scales decay gently
-        layered = simple_reverb(layered, sr, mix=mix, time_s=time_s, fb=fb)
+    # >>> tiny mix-bus glue reverb (post layering, pre speed/normalize)
+    layered = apply_bus_glue_reverb(layered, sr, send=0.25, return_db=-12.0, strength=1.0)
 
     # Global speed still affects the whole mix (tempo/pitch)
     final = resample_speed(layered, speed)
+    final = apply_bus_glue_reverb(final, sr, send=0.10, return_db=-12.0, strength=1.0)
     final = normalize(np.tanh(final * 1.04), 0.98)
 
     meta = {
@@ -917,7 +1139,7 @@ def process(input_file: str, bpm: int = 120, speed: float = 1.0,
         "sr": sr,
         "length_sec": round(len(final)/sr, 3),
         "chop_rate": float(rate),
-        "reverb": float(r),
+        "reverb": float(reverb),
     }
     return final, sr, meta
 
