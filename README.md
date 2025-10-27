@@ -1,6 +1,7 @@
 # wavbeat
 
 Turns any audio file into a beat-locked loop—constant-speed chops with legato crossfades, 4-on-the-floor kicks, sparse swung hats, optional backbeat claps, scheduled LP/BP sweeps, and glue reverb.  
+
 Drag-and-drop GUI with live knobs for BPM, bars, subdivision, global speed, chop-rate (chops only), hat density, and clap deviation; auto-saves numbered WAVs.   
 
 ## Parameters
@@ -16,3 +17,4 @@ Drag-and-drop GUI with live knobs for BPM, bars, subdivision, global speed, chop
 * `--clap` (flag): add claps on backbeats.
 * `--clap_dev_prob FLOAT` (default **0.10**): probability of bonus deviating clap (0..1).
 * `--clap_dev_ms FLOAT` (default **22.0**): max absolute deviation (ms) for bonus clap.
+
