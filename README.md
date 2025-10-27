@@ -25,4 +25,5 @@ Drag-and-drop GUI offers sliders for BPM, bars, subdivision, global speed, chop-
 | `--hat_density FLOAT` | **0.60** | Controls the hat density (lower values result in sparser hats). |
 | `--clap_dev_prob FLOAT` | **0.10** | Probability (0–1) of a bonus, deviating clap. |
 | `--clap_dev_ms FLOAT` | **22.0** | Maximum absolute deviation (in milliseconds) for the bonus clap. |
-| `--clap` | (optional toggle) | Adds claps on backbeats. |
+| `--clap` | Optional toggle. | Adds claps on backbeats. |
+
